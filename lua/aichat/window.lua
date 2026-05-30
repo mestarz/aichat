@@ -2,6 +2,7 @@
 local M = {}
 local config = require("aichat.config")
 local ai = require("aichat.ai")
+local tools = require("aichat.tools")
 
 -- 浮窗与缓冲区状态句柄
 M.chat_buf = nil
@@ -159,6 +160,8 @@ function M.open_results(results)
   local results_width = math.floor(columns * opts.window.results.width)
   local chat_height = math.floor(lines * opts.window.chat.height - opts.window.input.height - 4)
   
+  local row = math.floor((lines - (chat_height + opts.window.input.height + 4)) / 2)
+  
   -- 计算横向排版，让对话框和侧边检索框完美并列居中
   local total_w = chat_width + results_width + 4
   local start_col = math.floor((columns - total_w) / 2)
@@ -168,6 +171,7 @@ function M.open_results(results)
   if M.chat_win and vim.api.nvim_win_is_valid(M.chat_win) then
     vim.api.nvim_win_set_config(M.chat_win, {
       relative = "editor",
+      row = row,
       col = start_col,
       width = chat_width
     })
@@ -177,6 +181,7 @@ function M.open_results(results)
   if M.input_win and vim.api.nvim_win_is_valid(M.input_win) then
     vim.api.nvim_win_set_config(M.input_win, {
       relative = "editor",
+      row = row + chat_height + 2,
       col = start_col,
       width = chat_width
     })
