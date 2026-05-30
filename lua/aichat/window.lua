@@ -167,6 +167,7 @@ function M.open_results(results)
   -- 智能左移对话主窗体
   if M.chat_win and vim.api.nvim_win_is_valid(M.chat_win) then
     vim.api.nvim_win_set_config(M.chat_win, {
+      relative = "editor",
       col = start_col,
       width = chat_width
     })
@@ -175,6 +176,7 @@ function M.open_results(results)
   -- 智能左移提问输入框
   if M.input_win and vim.api.nvim_win_is_valid(M.input_win) then
     vim.api.nvim_win_set_config(M.input_win, {
+      relative = "editor",
       col = start_col,
       width = chat_width
     })
