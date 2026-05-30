@@ -179,9 +179,9 @@ function M.send_message(user_prompt, active_buf, on_chunk, on_complete, on_error
   -- 杜绝冗余搜索日志污染，发挥最高 Prefill 速度与生成精准度，无损保存撤销历史与渲染
   -- ==========================================
   if M.is_code_generation_task(user_prompt) and active_buf then
-    local branch_prompt = string.format(
-      "【Pi-Agent 代码生成分支】\n当前活动代码文件: %s\n行内代码邻近内容:\n```%s\n%s\n```\n光标所在行号: %d\n\n修改生成任务指令: %s\n\n"
-      .. "【重要指示】：请直接调用 edit_buffer (精确搜索替换) 或 insert_at_cursor (光标行内写入) 工具，以 JSON 格式代码块输出。本分支请只输出 JSON 工具块本身，严禁任何废话解释！",
+    local branch_prompt = M.branched_generation_prompt .. "\n\n" .. string.format(
+      "【Pi-Agent 代码生成分支指令】\n当前活动代码文件: %s\n行内代码邻近内容:\n```%s\n%s\n```\n光标所在行号: %d\n\n修改生成任务指令: %s\n\n"
+      .. "【重要指示】：你正处于 Neovim 代码编辑中。请立刻调用 edit_buffer (精确搜索替换) 或 insert_at_cursor (光标行内写入) 工具，以标准的 ```json ... ``` 格式代码块输出。本分支请只输出 JSON 工具块本身，严禁任何废话解释！",
       ctx.file_path,
       ctx.file_type,
       ctx.buffer_lines,
@@ -248,14 +248,14 @@ function M.send_message(user_prompt, active_buf, on_chunk, on_complete, on_error
   table.insert(M.global_history, { role = "user", content = user_prompt })
   prune_global_history()
 
-  -- 构建适合 Pi-Agent CLI 解析的长字符串上下文形式发送
+  -- 构建适合 Pi-Agent CLI 解析的长字符串上下文形式发送 (注入全局静态 system prompt 规范)
   local history_str = ""
   for _, item in ipairs(M.global_history) do
     history_str = history_str .. string.format("\n【%s】:\n%s\n", item.role == "user" and "用户提问" or "历史背景", item.content)
   end
   
-  local final_global_prompt = history_str .. "\n\n【最新提问指令】:\n" .. user_prompt
-    .. "\n\n【重要指示】：如果你要检索定位代码，请使用 find_files 或 grep_search 工具。插件会自动在 Neovim 右侧弹出全中文的 [代码定位结果] 面板，支持回车跳转与 p 键预览！如果要读取代码，请使用 read_file 模块。"
+  local final_global_prompt = M.static_system_prompt .. "\n\n" .. history_str .. "\n\n【最新提问指令】:\n" .. user_prompt
+    .. "\n\n【重要指示】：如果你要检索定位代码，请使用 find_files 或 grep_search 工具。插件会自动在 Neovim 右侧弹出全中文的 [代码定位结果] 面板，支持回车跳转与 p 键预览！如果要读取代码，请使用 read_file 模块。在输出工具调用时，请严格输出标准的 ```json ... ``` 格式代码块，不得携带任何闲聊解释！"
 
   run_pi_process(final_global_prompt, on_chunk, function(full_response)
     table.insert(M.global_history, { role = "assistant", content = full_response })
