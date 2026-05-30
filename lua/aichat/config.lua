@@ -2,6 +2,9 @@
 local M = {}
 
 M.defaults = {
+  backend = "deepseek", -- 后端核心路由支持："deepseek" (内置极速直连端) 或 "pi-agent" (Pi-Agent 代理服务端)
+  pi_agent_path = "pi", -- 本地全局或局部安装的 pi 命令行工具可执行路径
+  
   provider = "deepseek", -- 默认 AI 服务商
   api_key = vim.env.DEEPSEEK_API_KEY or "", -- 自动读取环境变量
   model = "deepseek-v4-flash", -- 2026年4月最新发布的极速 MoE 架构推理模型
