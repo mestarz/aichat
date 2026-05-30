@@ -385,6 +385,68 @@ function M.open(active_buf)
   vim.cmd("startinsert")
 end
 
+-- 辅助函数：根据用户提问，本地预先智能识别“检索/查找”意图并触发极速 ripgrep，秒级弹出侧边栏
+local function detect_and_run_local_search(prompt)
+  local query = nil
+  
+  -- 1. 尝试匹配被引号包裹的精准查询词 (如: 检索 "execute_tool_if_any")
+  query = prompt:match('["\'`]([^"\'`]+)["\'`]')
+  
+  if not query then
+    -- 2. 尝试标准中文/英文搜索模式提取查询词
+    local pattern_grep = {
+      "检索%s*包含%s*([^%s，。？]+)%s*的文件",
+      "检索%s*([^%s，。？]+)",
+      "grep%s*([^%s，。？]+)",
+      "查找%s*([^%s，。？]+)",
+      "搜索%s*([^%s，。？]+)"
+    }
+    for _, pat in ipairs(pattern_grep) do
+      local m = prompt:match(pat)
+      if m then
+        -- 过滤掉宽泛且无实际意义的词汇
+        if m ~= "文件" and m ~= "代码" and m ~= "函数" then
+          query = m
+          break
+        end
+      end
+    end
+  end
+
+  -- 如果成功提取出有效的 Grep 检索词，直接执行本地 ripgrep 搜索
+  if query and query ~= "" and #query > 1 then
+    local result = tools.grep_search(query)
+    if result.status == "success" and result.results and #result.results > 0 then
+      return result.results
+    end
+  end
+
+  -- 3. 尝试匹配“查找文件/搜索文件”意图
+  local file_pattern = nil
+  local pattern_find = {
+    "查找%s*文件%s*([^%s，。？]+)",
+    "找文件%s*([^%s，。？]+)",
+    "搜索文件%s*([^%s，。？]+)",
+    "find%s*file%s*([^%s，。？]+)"
+  }
+  for _, pat in ipairs(pattern_find) do
+    local m = prompt:match(pat)
+    if m then
+      file_pattern = m
+      break
+    end
+  end
+
+  if file_pattern and file_pattern ~= "" then
+    local result = tools.find_files(file_pattern)
+    if result.status == "success" and result.results and #result.results > 0 then
+      return result.results
+    end
+  end
+
+  return nil
+end
+
 -- 用户提交提问并唤起双通道分支 AI 回路
 function M.submit_prompt()
   if M.is_loading then return end
@@ -401,6 +463,12 @@ function M.submit_prompt()
   -- 向主面板追加渲染当前问题
   M.append_to_chat("👤 **您**:\n" .. prompt .. "\n\n")
   
+  -- === 智能预检黑科技：本地预先扫描与检索树弹出 ===
+  local local_results = detect_and_run_local_search(prompt)
+  if local_results then
+    M.open_results(local_results)
+  end
+
   -- 判断是否即将切换分支用于代码生成
   local is_gen = ai.is_code_generation_task(prompt)
   if is_gen then
