@@ -64,6 +64,8 @@ export default async function aichatNvimExtension(pi: ExtensionAPI) {
       "在 Neovim 编辑器右上角展示一张流程图。你只需输出【紧凑的逻辑描述】，插件会自动渲染成对齐的 ASCII 框线图——" +
       "千万不要自己用空格/横线手画对齐，那样既慢又费 token。" +
       "语法：每行一条边 `A -> B`，需要边标签写成 `A -> B : 标签`；节点内换行用字面量 \\n（如 `window.lua\\n用户输入`）。" +
+      "画图要求：聚焦用户真正问的主线、严格按用户提出的层次粒度组织、节点总数尽量控制在 10 个以内、" +
+      "并且必须是同一抽象层级（同一视图平面）的一张连贯图，不要混入不同层级的细节。" +
       "仅在「用图更能说明流程/架构」时调用；不需要图时不要调用。",
     parameters: Type.Object({
       content: Type.String({
@@ -109,12 +111,14 @@ export default async function aichatNvimExtension(pi: ExtensionAPI) {
     name: "goto_location",
     label: "跳转到代码位置",
     description:
-      "把光标跳转到某个当前可见文件的指定行并居中显示（翻页定位），用于回答「某功能/函数在哪一行/哪一块」。" +
-      "只能跳转到当前显示在可见窗口中的文件；若目标文件未显示在任何可见窗口，本工具会返回错误，" +
-      "此时应改用 present_text 向开发者说明位置，由开发者自行打开。",
+      "把光标跳转到某个文件的指定行并居中显示，跳转后编辑器处于普通(命令)模式，用于回答「某功能/函数在哪一行/哪一块」。" +
+      "目标文件已显示在可见窗口时直接跳；若未显示，会在主窗口中打开它（允许跨文件跳转）。" +
+      "【重要】只要这次跳转打开的文件与开发者跳转前所在文件不同（即跨文件跳转），" +
+      "你必须紧接着调用 present_diagram，画出跳转前文件与跳转后文件之间的调用/引用关系，并标明哪个是跳转前、哪个是跳转后的文件；" +
+      "若两者之间没有任何调用关系，则改用 present_text 文字说明。",
     parameters: Type.Object({
       path: Type.String({
-        description: "目标文件路径（必须是当前某个可见窗口中正在显示的文件）",
+        description: "目标文件路径（可见文件或磁盘上存在的文件）",
       }),
       line: Type.Number({ description: "目标行号（从 1 开始）" }),
       col: Type.Optional(Type.Number({ description: "目标列号（从 1 开始，可选）" })),

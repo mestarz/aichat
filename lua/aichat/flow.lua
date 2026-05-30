@@ -90,7 +90,7 @@ function F.looks_like_spec(content)
 end
 
 local H_GAP = 4 -- 同层方框之间的水平间距
-local V_GAP = 2 -- 层与层之间的垂直间距（用于走线 + 箭头）
+local V_GAP = 3 -- 层与层之间的垂直间距（茎 + 母线 + 箭头，留出分叉点）
 
 -- 字符画布：以「显示列」为坐标的稀疏网格，自动扩展，支持连线交叉合并为 +。
 local function new_canvas()
@@ -263,11 +263,12 @@ function F.render(spec)
     if pos[p] and pos[ch_] then
       local rp = rank[p]
       local pbot = pos[p].y + box[p].h - 1
-      local bus = pos[p].y + (layer_h[rp] or box[p].h) -- 父层底部下一行
+      -- 母线下移一行，使父框与母线之间有一段竖直「茎」，分叉/汇合点更清晰
+      local bus = pos[p].y + (layer_h[rp] or box[p].h) + 1
       local ctop = pos[ch_].y
       local pxc, cxc = pos[p].cx, pos[ch_].cx
 
-      -- 父框底 -> 母线行
+      -- 父框底 -> 母线行（竖直茎；分叉时这段让「一分为多」的起点醒目）
       for ry = pbot + 1, bus - 1 do canvas_set(c, ry, pxc, "|", true) end
 
       if pxc == cxc then

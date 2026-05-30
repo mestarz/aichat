@@ -32,6 +32,26 @@ local function find_visible_window_for(abs_path)
   return nil, nil
 end
 
+-- 查找一个适合用来「打开新文件」的主窗口：普通(非浮窗)窗口，
+-- 且不是本插件自身的列表/输入面板。优先返回当前窗口（若合适）。
+local function find_main_window()
+  local cur = vim.api.nvim_get_current_win()
+  local function ok(w)
+    if not vim.api.nvim_win_is_valid(w) then return false end
+    if vim.api.nvim_win_get_config(w).relative ~= "" then return false end
+    local b = vim.api.nvim_win_get_buf(w)
+    local bt = vim.api.nvim_buf_get_option(b, "buftype")
+    -- 排除 nofile/terminal 等非文件缓冲（本插件面板多为 nofile）
+    if bt ~= "" then return false end
+    return true
+  end
+  if ok(cur) then return cur end
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    if ok(w) then return w end
+  end
+  return nil
+end
+
 -- ============================================================
 -- 能力 1：展示与本次提问相关的文件（左侧扁平列表）
 --   files: string[]  或  { {path=..., reason=...}, ... }
@@ -154,9 +174,10 @@ function M.present_text(content)
 end
 
 -- ============================================================
--- 能力 5：把光标跳转到某个「可见文件」的指定行并居中（翻页定位）。
+-- 能力 5：把光标跳转到某个文件的指定行并居中（翻页定位）。
 --   path: 目标文件；line: 目标行(1 基)；col: 可选列(1 基)
---   若文件未显示在任何可见窗口，拒绝并提示改用 present_text。
+--   优先跳到已可见窗口；若文件未显示，则在主窗口中打开它。
+--   跳转后强制进入普通(命令)模式，便于继续用键盘浏览。
 -- ============================================================
 function M.goto_location(path, line, col)
   if type(path) ~= "string" or path == "" then
@@ -170,20 +191,42 @@ function M.goto_location(path, line, col)
 
   local abs = to_abs(path)
   local w, buf = find_visible_window_for(abs)
+  local opened_new = false
+
   if not w then
-    return {
-      status = "error",
-      message = "目标文件未显示在任何可见窗口中，无法跳转。请改用 present_text 向开发者说明：该功能位于哪个文件、第几行/哪一块，由开发者自行打开。",
-      path = path,
-    }
+    -- 文件未显示：在主窗口中打开它（允许跨文件跳转）
+    if vim.fn.filereadable(abs) ~= 1 then
+      return {
+        status = "error",
+        message = "目标文件在磁盘上不存在或不可读，无法打开：" .. path,
+        path = path,
+      }
+    end
+    local mw = find_main_window()
+    if not mw then
+      return {
+        status = "error",
+        message = "找不到可用于打开文件的主窗口，请改用 present_text 说明位置。",
+        path = path,
+      }
+    end
+    w = mw
+    opened_new = true
   end
 
-  local last = vim.api.nvim_buf_line_count(buf)
-  if line > last then line = last end
-
   vim.schedule(function()
+    vim.cmd("stopinsert") -- 强制普通(命令)模式，而非插入模式
     pcall(vim.api.nvim_set_current_win, w)
-    pcall(vim.api.nvim_win_set_cursor, w, { line, math.max(0, col - 1) })
+    if opened_new then
+      pcall(vim.api.nvim_win_call, w, function()
+        vim.cmd("edit " .. vim.fn.fnameescape(abs))
+      end)
+    end
+    local b = vim.api.nvim_win_get_buf(w)
+    local last = vim.api.nvim_buf_line_count(b)
+    local ln = line
+    if ln > last then ln = last end
+    pcall(vim.api.nvim_win_set_cursor, w, { ln, math.max(0, col - 1) })
     pcall(vim.api.nvim_win_call, w, function() vim.cmd("normal! zz") end)
   end)
 
@@ -191,7 +234,10 @@ function M.goto_location(path, line, col)
     status = "success",
     path = path,
     line = line,
-    message = string.format("已跳转到 %s 第 %d 行并居中显示。", path, line),
+    opened_new = opened_new,
+    message = opened_new
+        and string.format("已在主窗口打开 %s 并跳转到第 %d 行（普通模式）。注意：这是跨文件跳转，请用 present_diagram 画出原文件与该文件的调用关系（标明跳转前/跳转后的文件）；若两者无关，请用 present_text 说明。", path, line)
+        or string.format("已跳转到 %s 第 %d 行并居中显示（普通模式）。", path, line),
   }
 end
 
@@ -224,9 +270,9 @@ function M.list_tools()
     },
     {
       name = "goto_location",
-      description = "把光标跳转到某个当前可见文件的指定行并居中（翻页定位）。文件未显示在可见窗口时会拒绝，应改用 present_text 说明位置。",
+      description = "把光标跳转到某个文件的指定行并居中，并进入普通(命令)模式。可见文件直接跳；文件未显示则在主窗口打开它（允许跨文件跳转）。跨文件跳转后必须用 present_diagram 画出原文件与新文件的调用关系（标明跳转前/后的文件）；若两者无关则用 present_text 说明。",
       parameters = {
-        path = "string：目标文件路径（须是当前可见窗口中显示的文件）",
+        path = "string：目标文件路径",
         line = "number：目标行号(1 基)",
         col = "number：可选列号(1 基)",
       },
