@@ -290,11 +290,20 @@ function M.send_message(user_prompt, active_buf, on_chunk, on_complete, on_error
   -- ==========================================
   if #M.global_history == 0 then
     table.insert(M.global_history, { role = "system", content = M.static_system_prompt })
-    -- 第一轮追加活动文件概要
+    
+    -- 首次启动全局对话时，自动扫描获取工作区内的全部文件列表
+    local files_res = tools.find_files("")
+    local files_str = "未检索到任何文件"
+    if files_res.status == "success" and #files_res.results > 0 then
+      files_str = table.concat(files_res.results, ", ")
+    end
+    
+    -- 第一轮追加活动文件概要与整个项目工作区的文件清单，使 AI 彻底具备全局文件结构感知！
     local workspace_context = string.format(
-      "【初始代码工作区概要】\n当前活动文件: %s\n工作区目录: %s",
+      "【初始代码工作区概要】\n当前活动文件: %s\n工作区目录: %s\n整个项目已发现的代码文件清单: %s",
       ctx.file_path,
-      ctx.cwd
+      ctx.cwd,
+      files_str
     )
     table.insert(M.global_history, { role = "system", content = workspace_context })
   end
