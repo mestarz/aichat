@@ -3,7 +3,11 @@ local M = {}
 
 M.defaults = {
   pi_agent_path = "pi", -- 本地全局或局部安装的 pi 命令行工具可执行路径
-  global_context_limit = 512000, -- 全局解析上下文上限限制为 512K tokens
+  -- 模型预配置（默认 openai-codex / gpt-5.4-mini）
+  pi_provider = "openai-codex",
+  pi_model = "gpt-5.4-mini",
+  -- 透传给 pi 的额外参数（在 provider/model 之外，按需追加）
+  pi_extra_args = {},
 
   keymaps = {
     toggle = "<space><space>", -- 双击空格键触发/关闭 AI 助手

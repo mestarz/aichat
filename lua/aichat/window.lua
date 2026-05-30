@@ -1,555 +1,521 @@
--- aichat.nvim 智能悬浮窗口管理器 (全中文交互界面)
+-- aichat.nvim 窗口管理器（全中文交互）
+-- 设计：
+--   ① 顶部「提问输入框」：提交即关，想再问用空格空格重新唤起；
+--   ② 左侧「相关文件」真实分割窗（present_files）：每个文件带功能介绍，
+--      j/k 按「文件」跳转、跳过解释行，可用 <C-w> 原生切换；
+--   ③ 右上角「流程图」浮窗：仅当 AI 调用 present_diagram 时按需出现（AI 直接画 ASCII 字符画）；
+--   ④ 轻量「处理中」指示。不再展示任何文字回答——AI 的结论/解释全部经工具落地。
 local M = {}
 local config = require("aichat.config")
 local ai = require("aichat.ai")
-local tools = require("aichat.tools")
 
--- 浮窗与缓冲区状态句柄
-M.chat_buf = nil
-M.chat_win = nil
+-- 顶部输入框
 M.input_buf = nil
 M.input_win = nil
-M.results_buf = nil
-M.results_win = nil
 
-M.active_buf = nil -- 记录呼出助手前用户的活动缓冲区
-M.results_data = {} -- 映射检索面板的行号到具体的代码路径与行号
+-- 右上角流程图窗（按需）
+M.diagram_buf = nil
+M.diagram_win = nil
+M.diagram_title = nil
+
+-- 右上角文本说明窗（按需）：与流程图同位置，二者都在则「文字在上、图在下」
+M.text_buf = nil
+M.text_win = nil
+
+-- 轻量「处理中」状态浮窗
+M.status_buf = nil
+M.status_win = nil
+M.status_timer = nil
+
+-- 左侧相关文件面板
+M.files_buf = nil
+M.files_win = nil
+M.files_data = {}          -- 行号 -> { path = ... }
+M.files_header_lines = {}  -- 每个「文件名行」的行号，供 j/k 按文件跳转
+
+M.active_buf = nil -- 呼出助手前用户的活动缓冲区
 M.is_loading = false
-M.spinner_timer = nil
 
--- 初始化美化高亮组，完美贴合用户当前的主题（如 Tokyonight, Catppuccin 等）
+-- 按显示宽度把一段文本逐字折行（中文无空格，按 display width 切分）
+local function wrap_text(text, max_w)
+  text = tostring(text or ""):gsub("%s*\n%s*", " ")
+  local out, cur, cur_w = {}, "", 0
+  local n = vim.fn.strchars(text)
+  for i = 0, n - 1 do
+    local ch = vim.fn.strcharpart(text, i, 1)
+    local cw = vim.fn.strdisplaywidth(ch)
+    if cur_w + cw > max_w and cur ~= "" then
+      table.insert(out, cur)
+      cur, cur_w = "", 0
+    end
+    cur = cur .. ch
+    cur_w = cur_w + cw
+  end
+  if cur ~= "" then table.insert(out, cur) end
+  return out
+end
+
+-- ============================================================
+-- 左侧相关文件列表：像 nvim-tree/NERDTree 一样的「真实左侧分割窗口」，
+-- 而非浮窗——这样可以用 Neovim 原生 <C-w>h/l 等快捷键在窗口间切换、移动。
+--   items: { { path = "...", reason = "..." }, ... }
+-- ============================================================
+function M.open_file_list(items)
+  local width = math.max(28, math.floor(vim.o.columns * 0.22))
+
+  if not M.files_buf or not vim.api.nvim_buf_is_valid(M.files_buf) then
+    M.files_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_option(M.files_buf, "buftype", "nofile")
+    vim.api.nvim_buf_set_option(M.files_buf, "bufhidden", "hide")
+    vim.api.nvim_buf_set_option(M.files_buf, "swapfile", false)
+    vim.api.nvim_buf_set_option(M.files_buf, "filetype", "aichat-files")
+  end
+
+  -- 左侧竖直分割（普通窗口，可被 <C-w> 等原生命令切换/移动）。
+  -- 不抢占焦点：用户仍停留在原窗口，需要时自行 <C-w>h 进入文件列表。
+  if not (M.files_win and vim.api.nvim_win_is_valid(M.files_win)) then
+    local cur = vim.api.nvim_get_current_win()
+    vim.cmd("noautocmd topleft vertical " .. width .. " split")
+    M.files_win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(M.files_win, M.files_buf)
+    vim.api.nvim_win_set_option(M.files_win, "number", false)
+    vim.api.nvim_win_set_option(M.files_win, "relativenumber", false)
+    vim.api.nvim_win_set_option(M.files_win, "signcolumn", "no")
+    vim.api.nvim_win_set_option(M.files_win, "winfixwidth", true)
+    vim.api.nvim_win_set_option(M.files_win, "wrap", false)
+    vim.api.nvim_win_set_option(M.files_win, "cursorline", true)
+    if vim.api.nvim_win_is_valid(cur) then
+      vim.api.nvim_set_current_win(cur)
+    end
+  else
+    vim.api.nvim_win_set_width(M.files_win, width)
+  end
+
+  local content = { "  󰈚  相关文件 (Enter 打开，q 关闭)", "  ────────────────────────", "" }
+  M.files_data = {}
+  M.files_header_lines = {}
+
+  if not items or #items == 0 then
+    table.insert(content, "  ❌ 暂无相关文件。")
+  else
+    -- 解释行可用宽度：面板宽度减去前缀缩进与边距
+    local desc_w = math.max(8, width - 8)
+    for i, item in ipairs(items) do
+      table.insert(content, string.format("  [%d] 󰈚  %s", i, item.path))
+      M.files_data[#content] = { path = item.path }
+      table.insert(M.files_header_lines, #content)
+      if item.reason and item.reason ~= "" then
+        -- 功能介绍：按宽度折成多行显示在文件名下方，每行都映射回同一文件，
+        -- 但都不计入 header_lines，j/k 不会停在这些行上。
+        local wrapped = wrap_text(item.reason, desc_w)
+        for j, seg in ipairs(wrapped) do
+          local prefix = (j == 1) and "    ↳ " or "      "
+          table.insert(content, prefix .. seg)
+          M.files_data[#content] = { path = item.path }
+        end
+      end
+      table.insert(content, "")
+    end
+  end
+
+  vim.api.nvim_buf_set_option(M.files_buf, "modifiable", true)
+  vim.api.nvim_buf_set_lines(M.files_buf, 0, -1, false, content)
+  vim.api.nvim_buf_set_option(M.files_buf, "modifiable", false)
+
+  -- 初始光标落在第一个文件行
+  if M.files_header_lines[1] then
+    pcall(vim.api.nvim_win_set_cursor, M.files_win, { M.files_header_lines[1], 0 })
+  end
+
+  local map_opts = { buffer = M.files_buf, silent = true, noremap = true }
+
+  -- j/k（含方向键）：在「文件」之间移动，跳过功能介绍行，每次只移动一个文件
+  local function goto_file(delta)
+    local hs = M.files_header_lines
+    if #hs == 0 then return end
+    local cur = vim.api.nvim_win_get_cursor(M.files_win)[1]
+    local target
+    if delta > 0 then
+      for _, ln in ipairs(hs) do
+        if ln > cur then target = ln break end
+      end
+      target = target or hs[#hs]
+    else
+      for i = #hs, 1, -1 do
+        if hs[i] < cur then target = hs[i] break end
+      end
+      target = target or hs[1]
+    end
+    vim.api.nvim_win_set_cursor(M.files_win, { target, 0 })
+  end
+  vim.keymap.set("n", "j", function() goto_file(1) end, map_opts)
+  vim.keymap.set("n", "k", function() goto_file(-1) end, map_opts)
+  vim.keymap.set("n", "<Down>", function() goto_file(1) end, map_opts)
+  vim.keymap.set("n", "<Up>", function() goto_file(-1) end, map_opts)
+
+  -- 回车：在右侧的普通编辑窗口打开对应文件（排除文件列表窗与浮窗）
+  vim.keymap.set("n", "<CR>", function()
+    local cur = vim.api.nvim_win_get_cursor(M.files_win)[1]
+    local target = M.files_data[cur]
+    if not target then return end
+    local main_win = nil
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(w)
+        and w ~= M.files_win
+        and vim.api.nvim_win_get_config(w).relative == "" then
+        main_win = w
+        break
+      end
+    end
+    if main_win then
+      vim.api.nvim_set_current_win(main_win)
+      vim.cmd("edit " .. vim.fn.fnameescape(target.path))
+    end
+  end, map_opts)
+
+  vim.keymap.set("n", "q", function() M.close_file_list() end, map_opts)
+end
+
+function M.close_file_list()
+  if M.files_win and vim.api.nvim_win_is_valid(M.files_win) then
+    vim.api.nvim_win_close(M.files_win, true)
+  end
+  M.files_win = nil
+end
+
+-- 初始化高亮组，贴合用户主题
 local function setup_highlights()
   local hl_links = {
     AIChatHeader = "Title",
     AIChatTitle = "FloatTitle",
-    AIChatFile = "Directory",
-    AIChatLine = "Number",
-    AIChatComment = "Comment",
-    AIChatBorder = "FloatBorder",
-    AIChatSelected = "Visual",
-    AIChatPrompt = "Keyword"
+    AIChatPrompt = "Keyword",
   }
   for hl_name, link_to in pairs(hl_links) do
     vim.api.nvim_set_hl(0, hl_name, { link = link_to, default = true })
   end
 end
 
--- 关闭所有已开启的 AI 悬浮窗口，释放资源
-function M.close()
-  if M.spinner_timer then
-    M.spinner_timer:stop()
-    M.spinner_timer:close()
-    M.spinner_timer = nil
-  end
+-- ============================================================
+-- 右上角「文本说明 + 流程图」共享区域。
+--   两者同位置（右上角）；都存在时「文字在上、图在下」。
+--   ① present_text  -> show_text  ：≤300 字的精简说明
+--   ② present_diagram -> show_diagram：AI 直接绘制的 ASCII 字符画
+-- ============================================================
 
-  if M.input_win and vim.api.nvim_win_is_valid(M.input_win) then
-    vim.api.nvim_win_close(M.input_win, true)
-  end
-  if M.chat_win and vim.api.nvim_win_is_valid(M.chat_win) then
-    vim.api.nvim_win_close(M.chat_win, true)
-  end
-  if M.results_win and vim.api.nvim_win_is_valid(M.results_win) then
-    vim.api.nvim_win_close(M.results_win, true)
-  end
-
-  M.input_win = nil
-  M.chat_win = nil
-  M.results_win = nil
-  M.is_loading = false
+-- 右上角区域的横向几何（宽度、列偏移）
+local function topright_geom()
+  local columns = vim.o.columns
+  local width = math.max(40, math.floor(columns * 0.4))
+  local col = math.max(2, columns - width - 2)
+  return width, col
 end
 
--- 判断助手视窗是否处于打开状态
-function M.is_open()
-  return (M.chat_win and vim.api.nvim_win_is_valid(M.chat_win)) or
-         (M.input_win and vim.api.nvim_win_is_valid(M.input_win))
+-- 文本说明窗当前应有的高度（依内容行数，3~16 行）
+local function text_box_height()
+  local n = (M.text_buf and vim.api.nvim_buf_is_valid(M.text_buf))
+    and vim.api.nvim_buf_line_count(M.text_buf) or 3
+  return math.max(3, math.min(n, 16))
 end
 
--- 在提问输入框中通过快捷键控制上方聊天视窗滚动
-function M.scroll_chat(direction)
-  if not M.chat_win or not vim.api.nvim_win_is_valid(M.chat_win) then return end
-  local cmd = direction == "down" and [[\<C-d>]] or [[\<C-u>]]
-  vim.api.nvim_win_call(M.chat_win, function()
-    vim.cmd("normal! " .. vim.api.nvim_replace_termcodes(cmd, true, false, true))
-  end)
+local function text_win_opts()
+  local width, col = topright_geom()
+  return {
+    relative = "editor",
+    width = width,
+    height = text_box_height(),
+    row = 1,
+    col = col,
+    style = "minimal",
+    border = "rounded",
+    title = { { "  说明 (q 关闭) ", "AIChatHeader" } },
+    title_pos = "center",
+  }
 end
 
--- 向聊天缓冲区追加渲染文本 (支持 markdown 渲染格式)
-function M.append_to_chat(text)
-  if not M.chat_buf or not vim.api.nvim_buf_is_valid(M.chat_buf) then return end
-  
-  local lines = vim.api.nvim_buf_get_lines(M.chat_buf, 0, -1, false)
-  if #lines == 1 and lines[1] == "" then
-    lines = {}
+local function diagram_win_opts()
+  local width, col = topright_geom()
+  local lines = vim.o.lines
+  local row = 1
+  -- 若文本框在上方，流程图整体下移（文本高度 + 上下边框各 1 行）
+  if M.text_win and vim.api.nvim_win_is_valid(M.text_win) then
+    row = 1 + text_box_height() + 2
+  end
+  local height = math.max(8, math.floor(lines * 0.4))
+  local title = M.diagram_title and M.diagram_title ~= "" and M.diagram_title or "流程图"
+  return {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = row,
+    col = col,
+    style = "minimal",
+    border = "rounded",
+    title = { { "  " .. title .. " (q 关闭) ", "AIChatHeader" } },
+    title_pos = "center",
+  }
+end
+
+-- 流程图存在时，按文本框是否存在重新定位它
+local function reposition_diagram()
+  if M.diagram_win and vim.api.nvim_win_is_valid(M.diagram_win) then
+    vim.api.nvim_win_set_config(M.diagram_win, diagram_win_opts())
+  end
+end
+
+-- 右上角「文本说明」浮窗：仅当 AI 调用 present_text 时按需出现。
+--   content: 已精简的说明文本（服务端已截断到 300 字以内）
+function M.show_text(content)
+  local width = select(1, topright_geom())
+
+  if not M.text_buf or not vim.api.nvim_buf_is_valid(M.text_buf) then
+    M.text_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_option(M.text_buf, "buftype", "nofile")
+    vim.api.nvim_buf_set_option(M.text_buf, "filetype", "text")
   end
 
-  local new_lines = vim.split(text, "\n")
-  
-  if #lines > 0 then
-    -- 合并新输入的第一行与上一行末尾，避免产生多余断行
-    lines[#lines] = lines[#lines] .. new_lines[1]
-    for i = 2, #new_lines do
-      table.insert(lines, new_lines[i])
+  -- 保留 AI 的换行/分条结构：逐行处理，只对「超出宽度」的行再折行，
+  -- 续行缩进 2 格以保持条目层次（避免压成一坨）。
+  local max_w = math.max(8, width - 2)
+  local body_lines = {}
+  for _, raw in ipairs(vim.split(tostring(content or ""), "\n", { plain = true })) do
+    local line = raw:gsub("%s+$", "")
+    if line == "" then
+      table.insert(body_lines, "")
+    elseif vim.fn.strdisplaywidth(line) <= max_w then
+      table.insert(body_lines, line)
+    else
+      local segs = wrap_text(line, max_w)
+      for i, seg in ipairs(segs) do
+        table.insert(body_lines, (i == 1) and seg or ("  " .. seg))
+      end
     end
+  end
+  if #body_lines == 0 then body_lines = { "" } end
+  vim.api.nvim_buf_set_option(M.text_buf, "modifiable", true)
+  vim.api.nvim_buf_set_lines(M.text_buf, 0, -1, false, body_lines)
+  vim.api.nvim_buf_set_option(M.text_buf, "modifiable", false)
+
+  if M.text_win and vim.api.nvim_win_is_valid(M.text_win) then
+    vim.api.nvim_win_set_config(M.text_win, text_win_opts())
   else
-    lines = new_lines
+    M.text_win = vim.api.nvim_open_win(M.text_buf, false, text_win_opts())
+    vim.api.nvim_win_set_option(M.text_win, "wrap", true)
   end
 
-  vim.api.nvim_buf_set_option(M.chat_buf, "modifiable", true)
-  vim.api.nvim_buf_set_lines(M.chat_buf, 0, -1, false, lines)
-  vim.api.nvim_buf_set_option(M.chat_buf, "modifiable", false)
+  -- 文本框高度可能变化 -> 重新定位下方的流程图
+  reposition_diagram()
 
-  -- 自动滚动聚焦到最下方最新回答行
-  if M.chat_win and vim.api.nvim_win_is_valid(M.chat_win) then
-    local line_count = vim.api.nvim_buf_line_count(M.chat_buf)
-    vim.api.nvim_win_set_cursor(M.chat_win, { line_count, 0 })
-  end
+  vim.keymap.set("n", "q", function() M.close_text() end,
+    { buffer = M.text_buf, silent = true, noremap = true })
 end
 
--- 开启动态中文思考加载动画
+function M.close_text()
+  if M.text_win and vim.api.nvim_win_is_valid(M.text_win) then
+    vim.api.nvim_win_close(M.text_win, true)
+  end
+  M.text_win = nil
+  -- 文本框消失 -> 流程图回到顶部
+  reposition_diagram()
+end
+
+-- 右上角「流程图」浮窗：仅当 AI 调用 present_diagram 时按需出现。
+--   content: 纯 ASCII 字符画流程图（由 AI 直接绘制，无需任何外部渲染器）
+function M.show_diagram(content, title)
+  M.diagram_title = title
+
+  if not M.diagram_buf or not vim.api.nvim_buf_is_valid(M.diagram_buf) then
+    M.diagram_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_option(M.diagram_buf, "buftype", "nofile")
+    vim.api.nvim_buf_set_option(M.diagram_buf, "filetype", "text")
+  end
+
+  local body = type(content) == "string" and content or ""
+  -- 若内容是「逻辑描述」(含 -> 箭头)，本地确定性渲染成 ASCII；否则按原样显示。
+  local render_lines
+  local ok, flow = pcall(require, "aichat.flow")
+  if ok and flow.looks_like_spec(body) then
+    local rok, res = pcall(flow.render, body)
+    render_lines = rok and res or vim.split(body, "\n", { plain = true })
+  else
+    render_lines = vim.split(body, "\n", { plain = true })
+  end
+  vim.api.nvim_buf_set_option(M.diagram_buf, "modifiable", true)
+  vim.api.nvim_buf_set_lines(M.diagram_buf, 0, -1, false, render_lines)
+  vim.api.nvim_buf_set_option(M.diagram_buf, "modifiable", false)
+
+  if M.diagram_win and vim.api.nvim_win_is_valid(M.diagram_win) then
+    vim.api.nvim_win_set_config(M.diagram_win, diagram_win_opts())
+  else
+    M.diagram_win = vim.api.nvim_open_win(M.diagram_buf, false, diagram_win_opts())
+    vim.api.nvim_win_set_option(M.diagram_win, "wrap", false)
+  end
+
+  vim.keymap.set("n", "q", function() M.close_diagram() end,
+    { buffer = M.diagram_buf, silent = true, noremap = true })
+end
+
+function M.close_diagram()
+  if M.diagram_win and vim.api.nvim_win_is_valid(M.diagram_win) then
+    vim.api.nvim_win_close(M.diagram_win, true)
+  end
+  M.diagram_win = nil
+end
+
+-- ============================================================
+-- 轻量「处理中」指示：右上角一行小浮窗的旋转动画。
+-- ============================================================
 function M.start_spinner()
-  if not M.chat_win or not vim.api.nvim_win_is_valid(M.chat_win) then return end
   M.is_loading = true
-  
+  local columns = vim.o.columns
+  local width = 18
+
+  if not M.status_buf or not vim.api.nvim_buf_is_valid(M.status_buf) then
+    M.status_buf = vim.api.nvim_create_buf(false, true)
+  end
+
+  local opts = {
+    relative = "editor",
+    width = width,
+    height = 1,
+    row = 0,
+    col = math.max(0, columns - width - 1),
+    style = "minimal",
+    focusable = false,
+    zindex = 200,
+  }
+  if M.status_win and vim.api.nvim_win_is_valid(M.status_win) then
+    vim.api.nvim_win_set_config(M.status_win, opts)
+  else
+    M.status_win = vim.api.nvim_open_win(M.status_buf, false, opts)
+  end
+
   local frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
   local idx = 1
-
-  M.spinner_timer = vim.loop.new_timer()
-  M.spinner_timer:start(0, 100, vim.schedule_wrap(function()
-    if not M.is_loading or not M.chat_win or not vim.api.nvim_win_is_valid(M.chat_win) then
-      if M.spinner_timer then
-        M.spinner_timer:stop()
-        M.spinner_timer:close()
-        M.spinner_timer = nil
+  M.status_timer = vim.loop.new_timer()
+  M.status_timer:start(0, 100, vim.schedule_wrap(function()
+    if not M.is_loading or not M.status_win or not vim.api.nvim_win_is_valid(M.status_win) then
+      if M.status_timer then
+        M.status_timer:stop()
+        M.status_timer:close()
+        M.status_timer = nil
       end
       return
     end
-    
-    local spinner_title = " " .. frames[idx] .. " AI 助手正在思考中... "
-    vim.api.nvim_win_set_config(M.chat_win, {
-      title = { { spinner_title, "AIChatHeader" } }
-    })
-    
+    if M.status_buf and vim.api.nvim_buf_is_valid(M.status_buf) then
+      vim.api.nvim_buf_set_lines(M.status_buf, 0, -1, false, { " " .. frames[idx] .. " AI 处理中…" })
+    end
     idx = idx % #frames + 1
   end))
 end
 
--- 停止思考动画，还原标题
 function M.stop_spinner()
   M.is_loading = false
-  if M.spinner_timer then
-    M.spinner_timer:stop()
-    M.spinner_timer:close()
-    M.spinner_timer = nil
+  if M.status_timer then
+    M.status_timer:stop()
+    M.status_timer:close()
+    M.status_timer = nil
   end
-  if M.chat_win and vim.api.nvim_win_is_valid(M.chat_win) then
-    local opts = config.get()
-    vim.api.nvim_win_set_config(M.chat_win, {
-      title = { { opts.window.chat.title, "AIChatHeader" } }
-    })
+  if M.status_win and vim.api.nvim_win_is_valid(M.status_win) then
+    vim.api.nvim_win_close(M.status_win, true)
   end
+  M.status_win = nil
 end
 
--- 核心交互：侧边弹出代码检索结果定位面板 (并左移对话主窗体保持对称美)
-function M.open_results(results)
-  local opts = config.get()
-  
-  local columns = vim.o.columns
-  local lines = vim.o.lines
-  
-  local chat_width = math.floor(columns * opts.window.chat.width)
-  local results_width = math.floor(columns * opts.window.results.width)
-  local chat_height = math.floor(lines * opts.window.chat.height - opts.window.input.height - 4)
-  
-  local row = math.floor((lines - (chat_height + opts.window.input.height + 4)) / 2)
-  
-  -- 计算横向排版，让对话框和侧边检索框完美并列居中
-  local total_w = chat_width + results_width + 4
-  local start_col = math.floor((columns - total_w) / 2)
-  if start_col < 1 then start_col = 1 end
+-- ============================================================
+-- 生命周期
+-- ============================================================
+-- 关闭整个助手（输入框 + 文本框 + 流程图 + 状态 + 左侧文件列表）
+function M.close()
+  M.stop_spinner()
+  M.close_input()
+  M.close_text()
+  M.close_diagram()
+  M.close_file_list()
+  M.is_loading = false
+end
 
-  -- 智能左移对话主窗体
-  if M.chat_win and vim.api.nvim_win_is_valid(M.chat_win) then
-    vim.api.nvim_win_set_config(M.chat_win, {
-      relative = "editor",
-      row = row,
-      col = start_col,
-      width = chat_width
-    })
-  end
-  
-  -- 智能左移提问输入框
+-- 只关闭顶部输入框（提交后调用：流程图/文件列表保留，输入框消失）
+function M.close_input()
   if M.input_win and vim.api.nvim_win_is_valid(M.input_win) then
-    vim.api.nvim_win_set_config(M.input_win, {
-      relative = "editor",
-      row = row + chat_height + 2,
-      col = start_col,
-      width = chat_width
-    })
+    vim.api.nvim_win_close(M.input_win, true)
   end
-
-  -- 创建检索结果 Buffer
-  if not M.results_buf or not vim.api.nvim_buf_is_valid(M.results_buf) then
-    M.results_buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_option(M.results_buf, "filetype", "aichat-results")
-  end
-
-  -- 在右侧并排开启检索浮窗
-  local results_col = start_col + chat_width + 2
-  local results_opts = {
-    relative = "editor",
-    width = results_width,
-    height = chat_height + opts.window.input.height + 2,
-    row = math.floor((lines - (chat_height + opts.window.input.height + 4)) / 2),
-    col = results_col,
-    style = "minimal",
-    border = opts.window.results.border,
-    title = { { opts.window.results.title, "AIChatTitle" } },
-    title_pos = opts.window.results.title_pos,
-  }
-
-  if M.results_win and vim.api.nvim_win_is_valid(M.results_win) then
-    vim.api.nvim_win_set_config(M.results_win, results_opts)
-  else
-    M.results_win = vim.api.nvim_open_win(M.results_buf, false, results_opts)
-  end
-
-  -- 全中文格式化检索条目
-  local lines_content = {
-    "  󰈚  【代码逻辑检索定位结果】",
-    "  ────────────────────────────",
-    ""
-  }
-  M.results_data = {} -- 清空原有跳转映射
-
-  if not results or #results == 0 then
-    table.insert(lines_content, "  ❌ 未找到任何符合条件的代码位置。")
-  else
-    for i, item in ipairs(results) do
-      if type(item) == "string" then
-        -- find_files 文件名匹配结果
-        table.insert(lines_content, string.format("  [%d] 󰈚  %s", i, item))
-        M.results_data[#lines_content] = { file = item, line = 1 }
-        table.insert(lines_content, "")
-      else
-        -- grep_search 文本定位结果
-        table.insert(lines_content, string.format("  [%d] 󰈚  %s", i, item.file))
-        M.results_data[#lines_content] = { file = item.file, line = item.line }
-        table.insert(lines_content, string.format("       第 %d 行: %s", item.line, item.text))
-        M.results_data[#lines_content] = { file = item.file, line = item.line }
-        table.insert(lines_content, "")
-      end
-    end
-  end
-
-  vim.api.nvim_buf_set_option(M.results_buf, "modifiable", true)
-  vim.api.nvim_buf_set_lines(M.results_buf, 0, -1, false, lines_content)
-  vim.api.nvim_buf_set_option(M.results_buf, "modifiable", false)
-
-  -- 检索面板按键绑定
-  local result_map_opts = { buffer = M.results_buf, silent = true, noremap = true }
-  
-  -- 回车键：关闭 AI 面板并直接跳转至对应文件及行号
-  vim.keymap.set("n", "<CR>", function()
-    local cursor_row = vim.api.nvim_win_get_cursor(M.results_win)[1]
-    local target = M.results_data[cursor_row]
-    if target then
-      M.close()
-      vim.cmd("edit " .. vim.fn.fnameescape(target.file))
-      pcall(vim.api.nvim_win_set_cursor, 0, { target.line, 0 })
-      vim.cmd("normal! zz") -- 居中对齐
-      vim.notify("🎯 已跳转至文件: " .. target.file .. " 第 " .. target.line .. " 行", vim.log.levels.INFO)
-    end
-  end, result_map_opts)
-
-  -- 'p' 键：在后台非浮窗主编辑器中直接预览跳转（AI 面板保持开启）
-  vim.keymap.set("n", "p", function()
-    local cursor_row = vim.api.nvim_win_get_cursor(M.results_win)[1]
-    local target = M.results_data[cursor_row]
-    if target and M.active_buf then
-      local wins = vim.api.nvim_list_wins()
-      local main_win = nil
-      for _, win in ipairs(wins) do
-        local cfg = vim.api.nvim_win_get_config(win)
-        if cfg.relative == "" then
-          main_win = win
-          break
-        end
-      end
-
-      if main_win then
-        vim.api.nvim_win_call(main_win, function()
-          vim.cmd("edit " .. vim.fn.fnameescape(target.file))
-          pcall(vim.api.nvim_win_set_cursor, main_win, { target.line, 0 })
-          vim.cmd("normal! zz")
-        end)
-      end
-    end
-  end, result_map_opts)
-
-  -- 退出绑定
-  vim.keymap.set("n", "q", M.close, result_map_opts)
-  vim.keymap.set("n", "<Esc>", M.close, result_map_opts)
+  M.input_win = nil
 end
 
--- 打开 AI 智能助手主悬浮视窗
+-- 是否处于「等待输入」状态：仅以输入框为准，
+-- 这样即便流程图/文件列表还开着，再次空格空格也能重新唤起输入框。
+function M.is_open()
+  return M.input_win ~= nil and vim.api.nvim_win_is_valid(M.input_win)
+end
+
+-- 打开 AI 助手：只弹出顶部输入框
 function M.open(active_buf)
   setup_highlights()
   M.active_buf = active_buf or vim.api.nvim_get_current_buf()
 
   local opts = config.get()
   local columns = vim.o.columns
-  local lines = vim.o.lines
 
-  local chat_width = math.floor(columns * opts.window.chat.width)
-  local chat_height = math.floor(lines * opts.window.chat.height - opts.window.input.height - 4)
-  
-  local row = math.floor((lines - (chat_height + opts.window.input.height + 4)) / 2)
-  local col = math.floor((columns - chat_width) / 2)
-
-  -- 1. 创建对话主视窗
-  if not M.chat_buf or not vim.api.nvim_buf_is_valid(M.chat_buf) then
-    M.chat_buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_option(M.chat_buf, "filetype", "markdown")
-  end
-
-  local chat_opts = {
-    relative = "editor",
-    width = chat_width,
-    height = chat_height,
-    row = row,
-    col = col,
-    style = "minimal",
-    border = opts.window.chat.border,
-    title = { { opts.window.chat.title, "AIChatHeader" } },
-    title_pos = opts.window.chat.title_pos,
-  }
-  M.chat_win = vim.api.nvim_open_win(M.chat_buf, false, chat_opts)
-  
-  vim.api.nvim_win_set_option(M.chat_win, "wrap", true)
-  vim.api.nvim_win_set_option(M.chat_win, "scrolloff", 2)
-
-  -- 载入中文贴心使用指南
-  local line_cnt = vim.api.nvim_buf_line_count(M.chat_buf)
-  if line_cnt <= 1 and vim.api.nvim_buf_get_lines(M.chat_buf, 0, 1, false)[1] == "" then
-    local ctx = ai.get_editor_context(M.active_buf)
-    local greeting = "# 󰚩  欢迎使用 aichat.nvim 智能助手！\n"
-                  .. "当前捕获的活动代码文件: `" .. ctx.file_path .. "`\n"
-                  .. "────────────────────────────────────────────────────────────\n"
-                  .. "你可以向我发送各种指令，我将全速为您效劳：\n"
-                  .. "- **代码查找定位**：例如输入 *“帮我找一下 window 的打开逻辑在哪”*\n"
-                  .. "- **在文件代码生成**：例如输入 *“在这个文件里帮我增加一个计算斐波那契的函数”*\n"
-                  .. "- **上下文优化**：我们已深度优化 Prompt 缓存，首字响应几乎秒级渲染！\n"
-                  .. "────────────────────────────────────────────────────────────\n\n"
-    M.append_to_chat(greeting)
-  end
-
-  -- 2. 创建提问输入视窗
   if not M.input_buf or not vim.api.nvim_buf_is_valid(M.input_buf) then
     M.input_buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_option(M.input_buf, "filetype", "aichat-input")
   end
 
+  local in_width = math.max(40, math.floor(columns * 0.5))
   local input_opts = {
     relative = "editor",
-    width = chat_width,
+    width = in_width,
     height = opts.window.input.height,
-    row = row + chat_height + 2,
-    col = col,
+    row = 1,
+    col = 2,
     style = "minimal",
     border = opts.window.input.border,
     title = { { opts.window.input.title, "AIChatPrompt" } },
     title_pos = opts.window.input.title_pos,
   }
   M.input_win = vim.api.nvim_open_win(M.input_buf, true, input_opts)
-  
-  -- 输入框按键响应设定
+  vim.api.nvim_buf_set_lines(M.input_buf, 0, -1, false, { "" })
+
   local map_opts = { buffer = M.input_buf, silent = true, noremap = true }
-  
   vim.keymap.set({ "n", "i" }, "<Esc>", M.close, map_opts)
   vim.keymap.set({ "n", "i" }, "<C-c>", M.close, map_opts)
+  vim.keymap.set("i", "<CR>", function() M.submit_prompt() end, map_opts)
 
-  -- 回车直接发送问题
-  vim.keymap.set("i", "<CR>", function()
-    M.submit_prompt()
-  end, map_opts)
-
-  -- 滚动视窗快捷控制
-  vim.keymap.set({ "i", "n" }, "<C-d>", function() M.scroll_chat("down") end, map_opts)
-  vim.keymap.set({ "i", "n" }, "<C-u>", function() M.scroll_chat("up") end, map_opts)
-
-  -- Tab 键焦点切换
-  vim.keymap.set("n", "<Tab>", function()
-    if M.results_win and vim.api.nvim_win_is_valid(M.results_win) then
-      vim.api.nvim_set_current_win(M.results_win)
-    elseif M.chat_win and vim.api.nvim_win_is_valid(M.chat_win) then
-      vim.api.nvim_set_current_win(M.chat_win)
-    end
-  end, map_opts)
-
-  -- 默认自动唤起 insert 状态
   vim.cmd("startinsert")
 end
 
--- 辅助函数：根据用户提问，本地预先智能识别“检索/查找”意图并触发极速 ripgrep，秒级弹出侧边栏
-local function detect_and_run_local_search(prompt)
-  local query = nil
-  
-  -- 1. 尝试匹配被引号包裹的精准查询词 (如: 检索 "execute_tool_if_any")
-  query = prompt:match('["\'`]([^"\'`]+)["\'`]')
-  
-  if not query then
-    -- 2. 尝试标准中文/英文搜索模式提取查询词
-    local pattern_grep = {
-      "检索%s*包含%s*([^%s，。？]+)%s*的文件",
-      "检索%s*([^%s，。？]+)",
-      "grep%s*([^%s，。？]+)",
-      "查找%s*([^%s，。？]+)",
-      "搜索%s*([^%s，。？]+)"
-    }
-    for _, pat in ipairs(pattern_grep) do
-      local m = prompt:match(pat)
-      if m then
-        -- 过滤掉宽泛且无实际意义的词汇
-        if m ~= "文件" and m ~= "代码" and m ~= "函数" then
-          query = m
-          break
-        end
-      end
-    end
-  end
-
-  -- 如果成功提取出有效的 Grep 检索词，直接执行本地 ripgrep 搜索
-  if query and query ~= "" and #query > 1 then
-    local result = tools.grep_search(query)
-    if result.status == "success" and result.results and #result.results > 0 then
-      return result.results
-    end
-  end
-
-  -- 3. 尝试匹配“查找文件/搜索文件”意图
-  local file_pattern = nil
-  local pattern_find = {
-    "查找%s*文件%s*([^%s，。？]+)",
-    "找文件%s*([^%s，。？]+)",
-    "搜索文件%s*([^%s，。？]+)",
-    "find%s*file%s*([^%s，。？]+)"
-  }
-  for _, pat in ipairs(pattern_find) do
-    local m = prompt:match(pat)
-    if m then
-      file_pattern = m
-      break
-    end
-  end
-
-  if file_pattern and file_pattern ~= "" then
-    local result = tools.find_files(file_pattern)
-    if result.status == "success" and result.results and #result.results > 0 then
-      return result.results
-    end
-  end
-
-  return nil
-end
-
--- 用户提交提问并唤起双通道分支 AI 回路
+-- 提交提问：发一次消息，pi 自身完成完整 agent 循环（分析→调工具→继续）。
+-- 不展示任何文字回答；AI 的结论/解释全部通过 present_files / present_diagram /
+-- edit_file 这些工具落地（由 pi 原生调用，经扩展回连 lua/aichat/server.lua 执行）。
 function M.submit_prompt()
   if M.is_loading then return end
 
   local lines = vim.api.nvim_buf_get_lines(M.input_buf, 0, -1, false)
-  local prompt = table.concat(lines, "\n")
-  prompt = vim.trim(prompt)
-
+  local prompt = vim.trim(table.concat(lines, "\n"))
   if prompt == "" then return end
 
-  -- 清理提问框
   vim.api.nvim_buf_set_lines(M.input_buf, 0, -1, false, { "" })
 
-  -- 向主面板追加渲染当前问题
-  M.append_to_chat("👤 **您**:\n" .. prompt .. "\n\n")
-  
-  -- === 智能预检黑科技：本地预先扫描与检索树弹出 ===
-  local local_results = detect_and_run_local_search(prompt)
-  if local_results then
-    M.open_results(local_results)
-  end
-
-  -- 判断是否即将切换分支用于代码生成
-  local is_gen = ai.is_code_generation_task(prompt)
-  if is_gen then
-    M.append_to_chat("󰚩 **AI 助手 (已切出代码生成分支，极速处理中...)**:\n")
-  else
-    M.append_to_chat("󰚩 **AI 智能助手 (全局解析中...)**:\n")
-  end
-
-  -- 开启思考动画
+  -- 新一轮提问：清掉上一次的文本框与流程图
+  M.close_text()
+  M.close_diagram()
+  -- 提交即关输入框（想再问就空格空格重新唤起）
+  M.close_input()
+  -- 轻量处理中指示
   M.start_spinner()
 
-  -- 双上下文分支的多轮迭代闭环
-  local function run_chat_loop(current_prompt)
-    ai.send_message(
-      current_prompt,
-      M.active_buf,
-      -- on_chunk
-      function(chunk)
-        M.append_to_chat(chunk)
-      end,
-      -- on_complete
-      function(full_text, tool_run)
-        M.stop_spinner()
-        M.append_to_chat("\n\n")
-
-        if tool_run then
-          local result = tool_run.result
-          
-          -- 根据执行的不同工具呈现全中文的执行反馈
-          if tool_run.tool == "find_files" or tool_run.tool == "grep_search" then
-            M.append_to_chat("🛠️ *[执行全局定位: " .. tool_run.tool .. "]*\n")
-            if result.status == "success" then
-              M.open_results(result.results)
-              M.append_to_chat("🔍 *成功定位到 " .. #result.results .. " 处代码，已呈现在右侧定位面板中。*\n\n")
-            else
-              M.append_to_chat("❌ *定位执行失败: " .. result.message .. "*\n\n")
-            end
-          elseif tool_run.tool == "edit_buffer" or tool_run.tool == "insert_at_cursor" then
-            M.append_to_chat("🛠️ *[执行分支写入: " .. tool_run.tool .. "]*\n")
-            if result.status == "success" then
-              M.append_to_chat("✅ *代码段已成功写入 Neovim 活跃文件并保存！*\n\n")
-            else
-              M.append_to_chat("❌ *代码段写入失败: " .. result.message .. "*\n\n")
-            end
-          elseif tool_run.tool == "read_file" then
-            M.append_to_chat("🛠️ *[执行代码审查: 审查文件内容]*\n")
-            if result.status == "success" then
-              M.append_to_chat("📖 *成功读取 " .. result.file .. " 自 " .. result.start_line .. " 至 " .. result.end_line .. " 行内容。*\n\n")
-            else
-              M.append_to_chat("❌ *读取审查失败: " .. result.message .. "*\n\n")
-            end
-          end
-
-          -- 自动发起下一轮反馈，把执行状态递加在会话尾部，保证 prompt 缓存不失效
-          M.start_spinner()
-          local feedback_prompt = "工具调用执行反馈 (" .. tool_run.tool .. "):\n" .. vim.json.encode(result)
-          M.append_to_chat("󰚩 **AI 助手** (正在进行分析与确认):\n")
-          run_chat_loop(feedback_prompt)
-        else
-          -- 本轮流式交互彻底结束，还原输入焦点
-          if M.input_win and vim.api.nvim_win_is_valid(M.input_win) then
-            vim.api.nvim_set_current_win(M.input_win)
-            vim.cmd("startinsert")
-          end
-        end
-      end,
-      -- on_error
-      function(err_msg)
-        M.stop_spinner()
-        M.append_to_chat("\n❌ **发生错误**: " .. err_msg .. "\n\n")
-      end
-    )
-  end
-
-  -- 开启对话轮次！
-  run_chat_loop(prompt)
+  ai.send_message(prompt, M.active_buf, {
+    on_chunk = function(_chunk) end,            -- 不展示任何文字回答
+    on_tool_start = function(_name, _args) end, -- 工具调用不在前端显示
+    on_tool_end = function(_name, _result, _is_error) end,
+    on_complete = function(_full_text)
+      M.stop_spinner()
+    end,
+    on_error = function(err_msg)
+      M.stop_spinner()
+      vim.notify("aichat: " .. tostring(err_msg), vim.log.levels.ERROR)
+    end,
+  })
 end
 
 -- 快捷命令开关切换
