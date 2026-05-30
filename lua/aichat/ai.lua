@@ -1,10 +1,50 @@
--- aichat.nvim 智能多后端路由网关 (实现直连端与 Pi-Agent 代理服务的解耦与动态路由)
+-- aichat.nvim 智能多后端路由网关与核心状态编排管理器 (实现全局状态、会话剪枝、分支管理、工具解析的完全集约化)
 local M = {}
 local config = require("aichat.config")
-local deepseek = require("aichat.backends.deepseek")
-local pi_agent = require("aichat.backends.pi_agent")
+local tools = require("aichat.tools")
 
--- 1. 共享辅助函数：获取当前编辑器的全中文上下文信息 (供 window.lua 与各后端使用)
+-- 引入轻量级解耦后端执行端
+local deepseek_exec = require("aichat.backends.deepseek")
+local pi_agent_exec = require("aichat.backends.pi_agent")
+
+-- 1. 全局会话历史记录主存储 (Track A)
+M.global_history = {}
+
+-- 2. 重置会话历史记录
+function M.reset_history()
+  M.global_history = {}
+  vim.notify("󰚩 [aichat.nvim] AI 智能助手会话历史已成功重置！", vim.log.levels.INFO)
+end
+
+-- 3. 全局 512K 历史剪裁逻辑 (Track A) —— 集中化状态管理
+local function prune_global_history()
+  local opts = config.get()
+  local limit_chars = opts.global_context_limit * 4 -- 估算：1 token ≈ 4 字符
+
+  local total_chars = 0
+  for _, msg in ipairs(M.global_history) do
+    total_chars = total_chars + #msg.content
+  end
+
+  -- 超限一刀斩断除静态提示词之外的前半部分历史，瞬间腾出 250K 空间并保护缓存哈希
+  if total_chars > limit_chars and #M.global_history > 2 then
+    local total_items = #M.global_history
+    local remaining_count = total_items - 1
+    local to_remove = math.floor(remaining_count / 2)
+    
+    if to_remove > 0 then
+      for _ = 1, to_remove do
+        table.remove(M.global_history, 2)
+      end
+      
+      vim.schedule(function()
+        vim.notify("󰚩 [aichat.nvim] 全局解析上下文已超出 512K tokens 限制，已自动切除前半部旧会话以释放空间！", vim.log.levels.WARN)
+      end)
+    end
+  end
+end
+
+-- 4. 集中化辅助函数：获取当前编辑器的全中文上下文信息 (供 window.lua 使用)
 function M.get_editor_context(active_buf)
   local ctx = {
     file_path = "无 (当前未打开任何有效代码文件)",
@@ -22,7 +62,6 @@ function M.get_editor_context(active_buf)
     end
     ctx.file_type = vim.api.nvim_buf_get_option(active_buf, "filetype")
     
-    -- 寻找对应的 Window 获取光标位置
     local wins = vim.api.nvim_list_wins()
     for _, win in ipairs(wins) do
       if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == active_buf then
@@ -33,7 +72,6 @@ function M.get_editor_context(active_buf)
       end
     end
 
-    -- 智能获取光标上下邻近 75 行代码段，优化缓存命中
     local line_count = vim.api.nvim_buf_line_count(active_buf)
     local start_line = math.max(0, ctx.cursor_line - 75)
     local end_line = math.min(line_count, ctx.cursor_line + 75)
@@ -44,7 +82,7 @@ function M.get_editor_context(active_buf)
   return ctx
 end
 
--- 2. 共享辅助函数：智能判定任务类型是“全局定位/分析”，还是“在当前活跃文件行内写入/修改代码”
+-- 5. 集中化辅助函数：智能判定任务类型是“全局定位/分析”，还是“在当前活跃文件行内写入/修改代码”
 function M.is_code_generation_task(prompt)
   local keywords = {
     "add", "insert", "create", "delete", "write", "modify", "change", "replace", "generate",
@@ -59,24 +97,266 @@ function M.is_code_generation_task(prompt)
   return false
 end
 
--- 3. 动态消息路由：将提问发送至所配置的后端进行处理
-function M.send_message(user_prompt, active_buf, on_chunk, on_complete, on_error)
-  local opts = config.get()
-  
-  if opts.backend == "pi-agent" then
-    -- 路由至高级 Pi-Agent 代理客户端
-    pi_agent.send_message(user_prompt, active_buf, on_chunk, on_complete, on_error)
-  else
-    -- 路由至内置的直连端 DeepSeek 极速 MoE 客户端
-    deepseek.send_message(user_prompt, active_buf, on_chunk, on_complete, on_error)
+-- 6. 集中化静态提示词定义
+M.static_system_prompt = [[你是嵌入在极客开发环境 Neovim 编辑器中的 AI 智能编程助手 (aichat.nvim)。
+你是一流 of 软件工程大师，需要用严谨、干练且直切要害的中文来解答用户提问。
+
+核心规则：
+1. 你的一切回复、代码注释以及工作报告，必须完全使用【中文】编写。
+2. 每一个回答要逻辑清晰、字句精炼，严禁废话。
+3. 当且仅当用户需要你执行文件检索、代码查找（Grep）等操作时，你才可以通过输出一个 Markdown 格式的 JSON 代码块来发起工具调用。
+4. 调用工具时，你的回复中只能包含该 JSON 代码块本身，不得携带任何多余的寒暄与解释。
+
+可供调用的全局分析工具：
+
+1. 查找当前工作区下的文件：
+```json
+{
+  "tool": "find_files",
+  "arguments": {
+    "pattern": "待匹配的文件名或后缀"
+  }
+}
+```
+
+2. 在当前工作区所有代码文件内容中全局检索特定关键字 (Grep)：
+```json
+{
+  "tool": "grep_search",
+  "arguments": {
+    "query": "检索关键字"
+  }
+}
+```
+
+3. 读取某个具体文件的代码行段落：
+```json
+{
+  "tool": "read_file",
+  "arguments": {
+    "path": "文件路径",
+    "start_line": 1,
+    "end_line": 150
+  }
+}
+```
+]]
+
+M.branched_generation_prompt = [[你是 Neovim 下高阶代码编写分支器。
+你必须且只能使用下面两个工具，直接在当前编辑的文件中增添字段或修改逻辑。
+
+绝对指令：
+1. 不要输出任何额外的闲聊解释！只输出你用于修改或插入代码的 JSON 代码块。
+2. 对于 `edit_buffer`，确保 `search` 代码段与原文件内容一字不差地精准匹配。
+
+可供调用的代码生成与写入工具：
+
+1. 查找并替换文件中的指定代码段 (精确搜索替换)：
+```json
+{
+  "tool": "edit_buffer",
+  "arguments": {
+    "path": "待修改的文件路径",
+    "search": "待替换的完整代码原文",
+    "replace": "替换后的全新代码内容"
+  }
+}
+```
+
+2. 直接在用户当前编辑器光标位置插入/追加新代码：
+```json
+{
+  "tool": "insert_at_cursor",
+  "arguments": {
+    "content": "直接插入的全新代码块"
+  }
+}
+```
+]]
+
+-- 7. 集中化工具分析拦截逻辑
+local function execute_tool_if_any(response_text, active_buf)
+  local json_block = response_text:match("```json%s*(.-)%s*```")
+  if not json_block then
+    if response_text:sub(1, 1) == "{" and response_text:sub(-1, -1) == "}" then
+      json_block = response_text
+    end
   end
+
+  if not json_block then return nil end
+
+  local ok, decoded = pcall(vim.json.decode, json_block)
+  if not ok or not decoded or not decoded.tool then return nil end
+
+  local tool_name = decoded.tool
+  local args = decoded.arguments or {}
+  
+  local result = nil
+  if tool_name == "find_files" then
+    result = tools.find_files(args.pattern)
+  elseif tool_name == "grep_search" then
+    result = tools.grep_search(args.query)
+  elseif tool_name == "read_file" then
+    result = tools.read_file(args.path, args.start_line, args.end_line)
+  elseif tool_name == "edit_buffer" then
+    result = tools.edit_buffer(args.path, args.search, args.replace)
+  elseif tool_name == "insert_at_cursor" then
+    result = tools.insert_at_cursor(active_buf, args.content)
+  else
+    result = { status = "error", message = "未知的工具名称: " .. tostring(tool_name) }
+  end
+
+  return {
+    tool = tool_name,
+    args = args,
+    result = result
+  }
 end
 
--- 4. 动态历史路由：一键重置所有后端的会话记忆
-function M.reset_history()
-  deepseek.reset_history()
-  pi_agent.reset_history()
-  vim.notify("󰚩 [aichat.nvim] AI 智能助手会话历史（包括直连与 Pi-Agent）已成功重置！", vim.log.levels.INFO)
+-- 8. 集中化后端多路分发调度与会话编排
+function M.send_message(user_prompt, active_buf, on_chunk, on_complete, on_error)
+  local opts = config.get()
+  local ctx = M.get_editor_context(active_buf)
+
+  -- ==========================================
+  -- 路线 A: 判定为局部代码编辑写入生成任务 -> 【切出临时分支会话】
+  -- 杜绝冗余搜索日志污染，发挥最高 Prefill 速度与生成精准度
+  -- ==========================================
+  if M.is_code_generation_task(user_prompt) and active_buf then
+    local branch_prompt = ""
+    local messages_payload = nil
+    
+    if opts.backend == "pi-agent" then
+      branch_prompt = string.format(
+        "【Pi-Agent 代码生成分支】\n当前活动代码文件: %s\n行内代码邻近内容:\n```%s\n%s\n```\n光标所在行号: %d\n\n修改生成任务指令: %s\n\n"
+        .. "【重要指示】：请直接调用 edit_buffer (精确搜索替换) 或 insert_at_cursor (光标行内写入) 工具，以 JSON 格式代码块输出。本分支请只输出 JSON 工具块本身，严禁任何废话解释！",
+        ctx.file_path,
+        ctx.file_type,
+        ctx.buffer_lines,
+        ctx.cursor_line,
+        user_prompt
+      )
+    else
+      messages_payload = {
+        { role = "system", content = M.branched_generation_prompt },
+        {
+          role = "user",
+          content = string.format(
+            "【代码生成分支上下文】\n当前编辑文件: %s\n文件类型: %s\n光标所在行号: %d\n\n【文件邻近代码内容】:\n```%s\n%s\n```\n\n【生成任务说明】:\n%s",
+            ctx.file_path,
+            ctx.file_type,
+            ctx.cursor_line,
+            ctx.file_type,
+            ctx.buffer_lines,
+            user_prompt
+          )
+        }
+      }
+    end
+
+    -- 封装响应解析回调
+    local function handle_branch_complete(full_response)
+      local tool_run = execute_tool_if_any(full_response, active_buf)
+      
+      -- 生成最终的增量合并日志摘要
+      local merge_summary = ""
+      if tool_run then
+        merge_summary = string.format(
+          "🛠️ 【分支修改代码执行成功】\n执行后端: %s\n执行工具: %s\n修改文件: %s\n执行结果: %s",
+          opts.backend,
+          tool_run.tool,
+          ctx.file_path,
+          tool_run.result.status == "success" and "成功" or "失败"
+        )
+      else
+        merge_summary = string.format(
+          "💬 【分支生成并回复完成】\n回复摘要: %s",
+          full_response:sub(1, 150) .. "..."
+        )
+      end
+
+      -- 把这次分支变更同步回全局分析 Track A
+      if #M.global_history == 0 then
+        table.insert(M.global_history, { role = "system", content = M.static_system_prompt })
+      end
+      table.insert(M.global_history, { role = "user", content = user_prompt })
+      table.insert(M.global_history, { role = "assistant", content = merge_summary })
+      prune_global_history()
+
+      on_complete(full_response, tool_run)
+    end
+
+    -- 执行对应后端分发
+    if opts.backend == "pi-agent" then
+      pi_agent_exec.run_pi_process(branch_prompt, on_chunk, handle_branch_complete, on_error)
+    else
+      deepseek_exec.call_api(messages_payload, on_chunk, handle_branch_complete, on_error)
+    end
+
+    return
+  end
+
+  -- ==========================================
+  -- 路线 B: 全局解析 / 代码定位 Track A
+  -- 维护 512K tokens 长会话前缀哈希并滚动剪枝
+  -- ==========================================
+  if #M.global_history == 0 then
+    -- 全局首轮自动获取项目结构 outlines 写入上下文，使 AI 拥有全景项目感知
+    local files_res = tools.find_files("")
+    local files_str = "未检索到任何文件"
+    if files_res.status == "success" and #files_res.results > 0 then
+      files_str = table.concat(files_res.results, ", ")
+    end
+
+    table.insert(M.global_history, { role = "system", content = M.static_system_prompt })
+    local init_summary = string.format(
+      "【初始代码工作区概要】\n当前活动文件: %s\n工作区目录: %s\n整个项目已发现的代码文件清单: %s",
+      ctx.file_path,
+      ctx.cwd,
+      files_str
+    )
+    table.insert(M.global_history, { role = "system", content = init_summary })
+  end
+
+  -- 追加提问并修剪
+  table.insert(M.global_history, { role = "user", content = user_prompt })
+  prune_global_history()
+
+  -- 根据后端打包数据进行网络/进程请求
+  local function handle_global_complete(full_response)
+    table.insert(M.global_history, { role = "assistant", content = full_response })
+    prune_global_history()
+
+    local tool_run = execute_tool_if_any(full_response, active_buf)
+    if tool_run then
+      -- 执行了定位工具，将结果做成 user 增量反馈，发起多轮循环
+      local feedback_str = string.format(
+        "【全局定位工具执行结果】\n工具: %s\n执行状态: %s\n返回数据: \n%s",
+        tool_run.tool,
+        tool_run.result.status,
+        vim.json.encode(tool_run.result)
+      )
+      table.insert(M.global_history, { role = "user", content = feedback_str })
+      prune_global_history()
+    end
+
+    on_complete(full_response, tool_run)
+  end
+
+  if opts.backend == "pi-agent" then
+    -- 构建适合 Pi-Agent CLI 解析的长字符串上下文形式发送
+    local history_str = ""
+    for _, item in ipairs(M.global_history) do
+      history_str = history_str .. string.format("\n【%s】:\n%s\n", item.role == "user" and "用户提问" or "历史背景", item.content)
+    end
+    
+    local final_global_prompt = history_str .. "\n\n【最新提问指令】:\n" .. user_prompt
+      .. "\n\n【重要指示】：如果你要检索定位代码，请使用 find_files 或 grep_search 工具。插件会自动在 Neovim 右侧弹出全中文的 [代码定位结果] 面板，支持回车跳转与 p 键预览！如果要读取代码，请使用 read_file 模块。"
+
+    pi_agent_exec.run_pi_process(final_global_prompt, on_chunk, handle_global_complete, on_error)
+  else
+    deepseek_exec.call_api(M.global_history, on_chunk, handle_global_complete, on_error)
+  end
 end
 
 return M
