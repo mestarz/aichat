@@ -366,7 +366,7 @@ function M.call_api(messages_payload, on_chunk, on_complete_wrapper, on_error)
           local ok, decoded = pcall(vim.json.decode, json_str)
           if ok and decoded.choices and decoded.choices[1] and decoded.choices[1].delta then
             local content = decoded.choices[1].delta.content
-            if content then
+            if content and type(content) == "string" then
               complete_response = complete_response .. content
               vim.schedule(function() on_chunk(content) end)
             end
